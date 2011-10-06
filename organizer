@@ -1,0 +1,330 @@
+#! /usr/bin/ruby
+require 'readline'
+require 'httpclient'
+require 'nokogiri'
+require 'rb-inotify'
+require 'fileutils'
+require 'date'
+require 'logger'
+
+Encoding.default_internal = 'utf-8'
+Encoding.default_external = 'utf-8'
+
+class VideoOrganizer
+  def initialize options = {}
+    @logger = Logger.new options[:logfile] || "/var/log/organizer.log"
+    @logger.level = options[:loglevel] || Logger::INFO
+    @cache = {}
+    @source = options[:source]
+    @destination = options[:destination]
+    @trash = File.join @source, 'Unorganizable'
+    @url_generators = [
+      Proc.new{|video| "http://epguides.com/#{(video[:show].gsub /\s|the/i, '')}#{video[:location] ? "_#{video[:location]}" : ''}#{video[:year] ? "_#{video[:year]}" : ""}/"},
+      Proc.new{|video| "http://epguides.com/#{(video[:show].gsub /\s|the/i, '')}#{video[:year] ? "_#{video[:year]}" : ""}/"},
+      Proc.new{|video| "http://epguides.com/#{(video[:show].gsub /\s|the/i, '')}#{video[:location] ? "_#{video[:location]}" : ''}/"},
+      Proc.new{|video| "http://epguides.com/#{(video[:show].gsub /\s|the/i, '')}/"}
+    ]
+
+    Readline.basic_word_break_characters = Readline.basic_word_break_characters.sub ' ', ''
+    Readline::completion_proc = Proc.new do |prefix|
+      (Dir.glob File.join (glob_escape @destination), "*").map do |candidate|
+        candidate.gsub "#{@destination}/", ''
+      end.find_all do |candidate| 
+        candidate.start_with? prefix
+      end
+    end
+
+    Dir.chdir @source
+    
+    organize @source
+
+    notifier = INotify::Notifier.new
+    notifier.watch @source, :moved_to, :close_write do |event|
+      @logger.info "new event: #{event.absolute_name}"
+      begin
+        organize event.absolute_name
+      rescue SignalException => ex
+        # let signals propagate
+        raise ex
+      rescue Exception => ex
+        # keep going on any other exceptions
+        @logger.error ex.inspect + "\n" + (ex.backtrace.join "\n")
+      end
+    end
+    notifier.run
+  end
+
+  def organize path
+    @logger.debug "organize: #{path}"
+    if File.directory? path
+      (organizable_files path).each do |file|
+        organize file
+      end
+
+      if (organizable_files path).any?
+        # new files have appeared here that we didn't take care of yet in this round
+        organize path
+      else
+        # cleanup sub-dirs after we've handled all the files in them
+        FileUtils.rm_rf path unless path == @source
+      end
+    elsif File.exists? path
+      case File.extname path
+      when ".rar", /^\.r\d\d$/
+        unrar path
+      when ".mkv"
+        transcode path
+      when ".avi", ".mpg", ".mp4"
+        move path
+      else
+        punt path
+      end
+    end
+  end
+
+  def unrar path
+    @logger.debug "unraring: #{path}"
+    if ".rar" == (File.extname path)
+      file = `unrar lb "#{path}"`.strip
+      result = `unrar e "#{path}"`
+      if (File.exist? file) && $?.exitstatus == 0
+        files = Dir.glob (glob_escape path).sub /.rar$/, '.r[0-9][0-9]'
+        files << path
+        @logger.debug "deleting: #{files.join ', '}"
+        FileUtils.rm files
+        @logger.info "unrared: #{path}"
+      else
+        @logger.error "unrar error: #{path}\n#{result}"
+      end
+    end
+  end
+  
+  def transcode path
+    @logger.debug "transcoding: #{path}"
+    if '.mkv' == (File.extname path) 
+      # tsMuxer doesn't work, but that's ok, since ffmpeg works better
+      # output = `mediainfo "#{path}"`
+      # video_track = (output.match /Video\n([^\n]+:[^\n]+\n)*ID\s+:\s+([^\n]+)/m).to_a.last
+      # video_codec = (output.match /Video\n([^\n]+:[^\n]+\n)*Codec ID\s+:\s+([^\n]+)/m).to_a.last
+      # audio_track = (output.match /Audio\n([^\n]+:[^\n]+\n)*ID\s+:\s+([^\n]+)/m).to_a.last
+      # audio_codec = (output.match /Audio\n([^\n]+:[^\n]+\n)*Codec ID\s+:\s+([^\n]+)/m).to_a.last
+      # File.open '/tmp/tsmuxer.meta', 'w' do |f|
+      #   f << "MUXOPT --no-pcr-on-video-pid --new-audio-pes --vbr\n"
+      #   f << "#{video_codec}, #{path}, level=4.1, insertSEI, contSPS, track=#{video_track}, lang=eng\n"
+      #   f << "#{audio_codec}, #{path}, track=#{audio_track}, lang=eng\n"
+      # end
+      # command = "tsMuxeR /tmp/tsmuxer.meta \"#{path.sub (File.extname path), '.m2ts'}\""
+
+      output = path.sub '.mkv', '.mp4'
+      result = `ffmpeg -i "#{path}" -acodec copy -vcodec copy#{'.mkv' == (File.extname path) ? " -vbsf h264_mp4toannexb" : nil} -r 23.976 -f mp4 -threads 4 -y "#{output}"`
+      if 0 == $?.exitstatus && (File.exist? output) && (File.size output) > ((File.size path) / 2)
+        @logger.debug "rm: #{path}"
+        FileUtils.rm path
+        @logger.info "transcoded: #{path}"
+      else
+        #result = `ffmpeg -i "#{path}" -acodec libfaac -vcodec copy#{'.mkv' == (File.extname path) ? " -vbsf h264_mp4toannexb" : nil} -r 23.976 -f mp4 -threads 4 -y "#{output}"`
+        FileUtils.rm output
+        FileUtils.mv path, @trash
+        @logger.error "transcode error: #{result}"
+      end
+    end
+  end
+  
+  def move path
+    @logger.debug "moving: #{path}"
+    if ['.avi', '.mpg', '.mp4'].include? File.extname path
+      video = parse path
+      verify_info video
+
+      if video[:show]
+        title = ["", video[:title], video[:date], video[:resolution]].compact.join " - "
+        show = [video[:show], video[:location] ? video[:location].upcase : nil].compact.join " - "
+        if video[:season] && video[:episode]
+          destination = "#{@destination}/TV/#{show}/Season #{video[:season]}/Episode #{sprintf '%02d', video[:episode]}#{title}#{video[:extension]}"  
+          link = "#{@destination}/New/#{show} - Season #{video[:season]} - Episode #{sprintf '%02d', video[:episode]}#{title}#{video[:extension]}"
+        elsif video[:date]
+          destination = "#{@destination}/TV/#{show}/#{video[:date].year}/#{sprintf '%02d', video[:date].month}/#{sprintf '%02d', video[:date].day}#{title}#{video[:extension]}"
+          link = "#{@destination}/New/#{show} - #{video[:date]}#{title}#{video[:extension]}"
+        end
+      else
+        destination = "#{@destination}/Movies/#{video[:title]}#{video[:extension]}"
+        link = "#{@destination}/New/#{video[:title]}#{video[:extension]}"
+      end
+
+      FileUtils.mkdir_p File.dirname destination unless Dir.exists? File.dirname destination
+      FileUtils.chown "root", "users", (File.dirname destination)
+      FileUtils.chmod 0775, (File.dirname destination)
+      FileUtils.mv path, destination
+      FileUtils.chown "root", "users", destination
+      FileUtils.chmod 0664, destination
+      @logger.info "moved to: #{destination}"
+      if video[:date] && Date.today - video[:date] < 14
+        old = Dir.glob "#{@destination}/New/#{show}*"
+        if !old.empty?
+          FileUtils.rm old
+          @logger.info "  cleaned out old episodes: #{old.join ', '}"
+        end
+        FileUtils.ln_sf destination, link
+        @logger.info "  new: #{link}"
+      end
+    end
+  end
+
+  def punt path
+    @logger.info "punt: #{path}"
+    FileUtils.mkdir_p @trash unless Dir.exists? @trash
+    FileUtils.mv path, @trash
+  end
+  
+  def parse path
+    video = {:source => path}
+    if match = path.match(/#{@source}\/(.+)\/Season (\d+)\/Episode (\d+)(.*)(#{File.extname path})/)
+      video[:matched] = true
+      video[:show] = titleize match[1]
+      video[:season] = match[2].to_i
+      video[:episode] = match[3].to_i
+      video[:title] = titleize match[4]
+      video[:extension] = match[5]
+    elsif match = path.match(/#{@source}\/(.+)\/(\d{4}\/\d{2}\/\d{2})(.*)(#{File.extname path})/)
+      video[:matched] = true
+      video[:show] = titleize match[1]
+      video[:date] = Date.parse match[2]
+      video[:title] = titleize match[3]
+      video[:extension] = match[4]
+    elsif match = (File.basename path).match(/^(.*)(\d+)x(\d+)(.*)(#{File.extname path})$/i)
+      video[:matched] = true 
+      video[:show] = titleize match[1]
+      video[:season] = match[2].to_i
+      video[:episode] = match[3].to_i
+      video[:title] = titleize match[4]
+      video[:extension] = match[5]
+    elsif match = (File.basename path).match(/^(.*)s(\d+)e(\d+)(.*)(#{File.extname path})$/i)
+      video[:matched] = true 
+      video[:show] = titleize match[1]
+      video[:season] = match[2].to_i
+      video[:episode] = match[3].to_i
+      video[:title] = titleize match[4]
+      video[:extension] = match[5]
+    elsif match = (File.basename path).match(/^(.*)(\d{4}.\d{2}.\d{2})(.*)(#{File.extname path})$/i)
+      video[:matched] = true 
+      video[:show] = titleize match[1]
+      video[:date] = Date.parse match[2]
+      video[:title] = titleize match[3]
+      video[:extension] = match[4]
+    else
+      video[:title] = titleize(File.basename(path, File.extname(path)))
+      video[:extension] = File.extname path
+    end
+    video[:year] = path.match(/\b(\d{4})\b[^\d]{2}/).to_a.last
+    video[:year] = nil unless video[:year].to_i > 1930 && video[:year].to_i <= Date.today.year
+    video[:location] = path.match(/\b(US|UK)\b/i).to_a.last
+    video[:resolution] = path.match(/\b(480[ip]|720[ip]|1080[ip])\b/).to_a.last
+    video
+  end    
+
+  def titleize title
+    title.gsub! /[\.\-\_\[\]\+]/, ' '
+    title.gsub! /\b(480[ip]|720[ip]|1080[ip]|\d{4}|2hd|aaf|ac3|BBC|bia|bluray|cd|ctu|dimension|divx|dts|dvd|dvdrip|dxva|eztv|fqm|framestore|haggis|hdtv|hq|immerse|lol|maxvid|nogrp|notv|orenji|proper|repack|speed|UK|US|vtv|www|xvid|x264|\(download at superseeds org\))\b/i, ''
+    title = title.split.map do |word| 
+      if %w{a an the with on of off per up via for as at by in to but and or so vs}.include? word.downcase
+        word.downcase
+      else
+        word.capitalize
+      end
+    end.join ' '
+
+    if title && title[0]
+      title[0] = title[0].upcase
+    end
+    if title.empty?
+      nil
+    else
+      title
+    end
+  end
+
+  def verify_info video
+    @logger.debug "verifying info: #{video[:show]}"
+    if video[:show] 
+#      if ! (Dir.exists? "#{@destination}/TV/#{video[:show]}")
+#        logger.debug "#{video[:show]} is not an existing show.  Enter a new name using tab completion or press enter to use #{video[:show]}:\n"  
+#        new_show = titleize Readline.readline
+#        if new_show && !new_show.strip.empty?
+#          if video[:show].start_with? new_show
+#            logger.info "Is \"#{titleize video[:show].sub new_show, ''}\" part of the episode title? [y/n]:"
+#            if gets.chomp == "y"
+#              video[:title].insert 0, (titleize video[:show].sub new_show, '')
+#            end
+#          end
+#          video[:show] = new_show
+#        end
+#      end
+
+      html = Nokogiri::HTML fetch_info video
+      table = html.xpath '//div[@id="eplist"]'
+      if table
+        rows = table.text.split("\r\n")
+        if rows
+          if video[:episode]
+            row = rows.find{|row| row =~ /\b#{video[:season]}-#{sprintf '%02d', video[:episode]}\b/}
+          elsif video[:date]
+            row = rows.find{|row| row.include? video[:date].strftime '%d/%b/%y'}
+          end
+          if row
+            match = row.match /(\d+)\s+(\d+)\-(\d+)\s+([\w\-]+)?\s+(\d+\/\w+\/\d+)\s+([^\[]*)/
+            if match
+              video[:season] = match[2].to_i
+              video[:episode] = match[3].to_i
+              video[:date] = Date.parse match[5] rescue nil
+              video[:title] = match[6].strip
+              @logger.info "verified: #{video[:show]}"
+            else
+              @logger.warn "verification error: no matching episode listed"
+              @logger.debug row
+            end
+          else
+            @logger.warn "verification error: no recognizeable episode information"
+            @logger.debug rows
+          end
+        else
+          @logger.warn "verification error: no recognizeable episodes"
+          @logger.debug
+          @logger.debug table
+        end
+      else
+        @logger.warn "verification error: unrecognized show"
+      end
+    end
+  end
+  
+  def fetch_info video
+    @logger.debug "fetch info: #{video}"
+    key = "#{video[:show]}#{video[:year]}#{video[:location]}"
+    if @cache[key]
+      @cache[key]
+    else
+      try = 0
+      begin
+        url = @url_generators[try].call video
+        @logger.debug "  from: #{url}"
+        @cache[key] = (HTTPClient.new.get_content url)
+      rescue HTTPClient::BadResponseError => ex
+        if (try += 1) < @url_generators.size
+          retry
+        else
+          @cache[key] = ""
+        end
+      end
+    end
+  end
+
+  def organizable_files path
+    (Dir.glob File.join (glob_escape path), '*').reject{|path| %w{sample unorganizable}.include? File.basename(path).downcase}
+  end
+
+  def glob_escape path
+    path.gsub /([\[\]\{\}\*\?])/, {'[' => '\[', ']' => '\]', '{' => '\{', '}' => '\}', '*' => '\*', '?' => '\?'}
+  end
+end
+
+VideoOrganizer.new :source => "/home/public/Download/Organize", :destination => "/home/public/Video", :loglevel => Logger::DEBUG
