@@ -1,4 +1,4 @@
-
+# natalie was here
 require 'time'
 
 unicorn_cpu = `ps -o cputime -C unicorn_rails`.split("\n")[1..-1].inject(0){|sum,i| sum + ((Time.parse i) - (Time.parse '00:00:00')).to_i}
